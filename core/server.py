@@ -10,6 +10,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import Scope, Receive, Send
 from starlette.requests import Request
 from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
@@ -39,6 +40,15 @@ _auth_provider: Optional[GoogleProvider] = None
 _legacy_callback_registered = False
 
 session_middleware = Middleware(MCPSessionMiddleware)
+
+# CORS middleware for OAuth endpoints - allows MCP Inspector and other browser clients
+cors_middleware = Middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for OAuth discovery
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 
 class WellKnownCacheControlMiddleware:
@@ -89,15 +99,17 @@ class SecureFastMCP(FastMCP):
         app = super().http_app(**kwargs)
 
         # Add middleware in order (first added = outermost layer)
-        app.user_middleware.insert(0, well_known_cache_control_middleware)
+        # CORS must be outermost to add headers to all responses
+        app.user_middleware.insert(0, cors_middleware)
+        app.user_middleware.insert(1, well_known_cache_control_middleware)
 
         # Session Management - extracts session info for MCP context
-        app.user_middleware.insert(1, session_middleware)
+        app.user_middleware.insert(2, session_middleware)
 
         # Rebuild middleware stack
         app.middleware_stack = app.build_middleware_stack()
         logger.info(
-            "Added middleware stack: WellKnownCacheControl, Session Management"
+            "Added middleware stack: CORS, WellKnownCacheControl, Session Management"
         )
         return app
 
