@@ -100,9 +100,10 @@ class MinimalOAuthServer:
                 return create_success_response(verified_user_id)
 
             except Exception as e:
-                error_message_detail = f"Error processing OAuth callback: {str(e)}"
-                logger.error(error_message_detail, exc_info=True)
-                return create_server_error_response(str(e))
+                logger.error(f"Error processing OAuth callback: {str(e)}", exc_info=True)
+                return create_server_error_response(
+                    "An internal error occurred during authentication. Please try again."
+                )
 
     def _setup_attachment_route(self):
         """Setup the attachment serving route."""

@@ -7,7 +7,6 @@ services:
     environment:
       - GOOGLE_MCP_CREDENTIALS_DIR=/app/store_creds
     volumes:
-      - ./client_secret.json:/app/client_secret.json:ro
       - store_creds:/app/store_creds:rw
     env_file:
       - .env

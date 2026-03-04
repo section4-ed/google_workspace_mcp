@@ -22,7 +22,7 @@ RUN useradd --create-home --shell /bin/bash app \
 # Give read and write access to the store_creds volume
 RUN mkdir -p /app/store_creds \
     && chown -R app:app /app/store_creds \
-    && chmod 755 /app/store_creds
+    && chmod 700 /app/store_creds
 
 USER app
 
