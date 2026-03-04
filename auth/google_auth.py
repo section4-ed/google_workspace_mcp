@@ -495,8 +495,10 @@ def handle_auth_callback(
                 "The 'client_secrets_path' parameter is deprecated. Use GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET environment variables instead."
             )
 
-        # Allow HTTP for localhost in development
-        if "OAUTHLIB_INSECURE_TRANSPORT" not in os.environ:
+        # Allow HTTP for localhost in development only
+        if "OAUTHLIB_INSECURE_TRANSPORT" not in os.environ and (
+            "localhost" in redirect_uri or "127.0.0.1" in redirect_uri
+        ):
             logger.warning(
                 "OAUTHLIB_INSECURE_TRANSPORT not set. Setting it for localhost development."
             )

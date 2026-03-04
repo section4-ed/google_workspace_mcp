@@ -101,7 +101,22 @@ def validate_file_path(file_path: str) -> Path:
                 "path is in a restricted system location."
             )
 
+    # Block the credential store directory (WORKSPACE_MCP_CREDENTIALS_DIR takes
+    # precedence, falling back to GOOGLE_MCP_CREDENTIALS_DIR for compatibility)
+    creds_dir = os.environ.get(
+        "WORKSPACE_MCP_CREDENTIALS_DIR",
+        os.environ.get("GOOGLE_MCP_CREDENTIALS_DIR", ""),
+    )
+    if creds_dir:
+        creds_resolved = str(Path(creds_dir).resolve())
+        if resolved_str == creds_resolved or resolved_str.startswith(creds_resolved + "/"):
+            raise ValueError(
+                f"Access to '{resolved_str}' is not allowed: "
+                "path is in the credential storage directory."
+            )
+
     # Block sensitive directories that commonly contain credentials/keys
+    home = Path.home()
     sensitive_dirs = (
         ".ssh",
         ".aws",
@@ -110,7 +125,6 @@ def validate_file_path(file_path: str) -> Path:
         ".config/gcloud",
     )
     for sensitive_dir in sensitive_dirs:
-        home = Path.home()
         blocked = home / sensitive_dir
         if resolved == blocked or str(resolved).startswith(str(blocked) + "/"):
             raise ValueError(
@@ -195,7 +209,7 @@ def check_credentials_directory_permissions(credentials_dir: str = None) -> None
         else:
             # Directory doesn't exist, try to create it and its parent directories
             try:
-                os.makedirs(credentials_dir, exist_ok=True)
+                os.makedirs(credentials_dir, mode=0o700, exist_ok=True)
                 # Test writing to the new directory
                 test_file = os.path.join(credentials_dir, ".permission_test")
                 with open(test_file, "w") as f:
@@ -216,7 +230,7 @@ def check_credentials_directory_permissions(credentials_dir: str = None) -> None
                 )
 
     except PermissionError:
-        raise
+        raise  # re-raise as-is; the inner blocks already wrap with context
     except Exception as e:
         raise OSError(
             f"Unexpected error checking credentials directory permissions: {e}"

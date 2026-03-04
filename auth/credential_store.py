@@ -116,11 +116,26 @@ class LocalDirectoryCredentialStore(CredentialStore):
         )
 
     def _get_credential_path(self, user_email: str) -> str:
-        """Get the file path for a user's credentials."""
+        """Get the file path for a user's credentials.
+
+        Validates the email to prevent path traversal attacks, then resolves
+        the path canonically to confirm it stays within the base directory.
+        """
+        safe_name = os.path.basename(user_email)
+        if safe_name != user_email or "/" in user_email or "\\" in user_email:
+            raise ValueError(f"Invalid user email for credential path: {user_email!r}")
+
         if not os.path.exists(self.base_dir):
-            os.makedirs(self.base_dir)
+            os.makedirs(self.base_dir, mode=0o700)
             logger.info(f"Created credentials directory: {self.base_dir}")
-        return os.path.join(self.base_dir, f"{user_email}.json")
+        else:
+            os.chmod(self.base_dir, 0o700)
+
+        resolved = os.path.realpath(os.path.join(self.base_dir, f"{safe_name}.json"))
+        base_real = os.path.realpath(self.base_dir)
+        if not (resolved == base_real or resolved.startswith(base_real + os.sep)):
+            raise ValueError("Credential path traversal attempt detected")
+        return resolved
 
     def get_credential(self, user_email: str) -> Optional[Credentials]:
         """Get credentials from local JSON file."""
@@ -145,12 +160,19 @@ class LocalDirectoryCredentialStore(CredentialStore):
                 except (ValueError, TypeError) as e:
                     logger.warning(f"Could not parse expiry time for {user_email}: {e}")
 
+            client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or creds_data.get("client_secret")
+            if not client_secret:
+                logger.warning(
+                    f"client_secret is absent for {user_email} and GOOGLE_OAUTH_CLIENT_SECRET is not set; "
+                    "token refresh will fail when the access token expires."
+                )
+
             credentials = Credentials(
                 token=creds_data.get("token"),
                 refresh_token=creds_data.get("refresh_token"),
                 token_uri=creds_data.get("token_uri"),
-                client_id=creds_data.get("client_id"),
-                client_secret=creds_data.get("client_secret"),
+                client_id=os.getenv("GOOGLE_OAUTH_CLIENT_ID", creds_data.get("client_id")),
+                client_secret=client_secret,
                 scopes=creds_data.get("scopes"),
                 expiry=expiry,
             )
@@ -168,18 +190,21 @@ class LocalDirectoryCredentialStore(CredentialStore):
         """Store credentials to local JSON file."""
         creds_path = self._get_credential_path(user_email)
 
+        # client_secret is intentionally excluded from persisted data;
+        # it is supplied at runtime via the GOOGLE_OAUTH_CLIENT_SECRET env var.
         creds_data = {
             "token": credentials.token,
             "refresh_token": credentials.refresh_token,
             "token_uri": credentials.token_uri,
             "client_id": credentials.client_id,
-            "client_secret": credentials.client_secret,
             "scopes": credentials.scopes,
             "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
         }
 
         try:
-            with open(creds_path, "w") as f:
+            # Atomically create the file with restricted permissions (owner rw only)
+            fd = os.open(creds_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 json.dump(creds_data, f, indent=2)
             logger.info(f"Stored credentials for {user_email} to {creds_path}")
             return True

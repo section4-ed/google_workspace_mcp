@@ -1,4 +1,5 @@
 import hashlib
+import html
 import logging
 import os
 from typing import List, Optional
@@ -511,11 +512,10 @@ async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
     error = request.query_params.get("error")
 
     if error:
-        msg = (
-            f"Authentication failed: Google returned an error: {error}. State: {state}."
+        logger.error(f"Authentication failed: Google returned error: {error}. State: {state}.")
+        return create_error_response(
+            f"Authentication failed: Google returned an error: {html.escape(error)}."
         )
-        logger.error(msg)
-        return create_error_response(msg)
 
     if not code:
         msg = "Authentication failed: No authorization code received from Google."
@@ -568,7 +568,9 @@ async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
         return create_success_response(verified_user_id)
     except Exception as e:
         logger.error(f"Error processing OAuth callback: {str(e)}", exc_info=True)
-        return create_server_error_response(str(e))
+        return create_server_error_response(
+            "An internal error occurred during authentication. Please try again."
+        )
 
 
 @server.tool()
