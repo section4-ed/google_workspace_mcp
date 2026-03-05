@@ -4,8 +4,9 @@ Google Slides MCP Tools
 This module provides MCP tools for interacting with Google Slides API.
 """
 
-import logging
 import asyncio
+import copy
+import logging
 from typing import List, Dict, Any
 
 
@@ -15,6 +16,116 @@ from core.utils import handle_http_errors
 from core.comments import create_comment_tools
 
 logger = logging.getLogger(__name__)
+
+
+# Mapping from Google Slides predefined layout enum names to common layout name
+# patterns found in master slides.  Used as fallback heuristics when the exact
+# predefined layout is not present in a custom theme.
+_LAYOUT_NAME_HINTS: Dict[str, List[str]] = {
+    "BLANK": ["blank"],
+    "CAPTION_ONLY": ["caption"],
+    "TITLE": ["title slide", "title"],
+    "TITLE_AND_BODY": ["title and body", "title, body"],
+    "TITLE_AND_TWO_COLUMNS": ["two column", "title and two columns", "two col"],
+    "TITLE_ONLY": ["title only"],
+    "SECTION_HEADER": ["section header", "section title", "section"],
+    "ONE_COLUMN_TEXT": ["one column"],
+    "MAIN_POINT": ["main point"],
+    "BIG_NUMBER": ["big number"],
+}
+
+
+async def _get_presentation_layouts(
+    service, presentation_id: str
+) -> Dict[str, str]:
+    """Return a mapping of predefined layout enum name (e.g. "BLANK") to layout objectId.
+
+    Fetches the presentation's actual layouts and matches them to predefined
+    names using display-name heuristics from ``_LAYOUT_NAME_HINTS``.
+    """
+    presentation = await asyncio.to_thread(
+        service.presentations()
+        .get(
+            presentationId=presentation_id,
+            fields="layouts(objectId,layoutProperties/displayName)",
+        )
+        .execute
+    )
+
+    layout_by_predefined: Dict[str, str] = {}
+    layout_by_name: Dict[str, str] = {}
+
+    for layout in presentation.get("layouts", []):
+        layout_id = layout.get("objectId", "")
+        props = layout.get("layoutProperties", {})
+        display_name = props.get("displayName", "")
+        name_lower = display_name.lower().strip()
+
+        if name_lower:
+            layout_by_name[name_lower] = layout_id
+
+    for predefined_name, hints in _LAYOUT_NAME_HINTS.items():
+        for hint in hints:
+            if hint in layout_by_name:
+                layout_by_predefined[predefined_name] = layout_by_name[hint]
+                break
+
+    return layout_by_predefined
+
+
+async def _resolve_create_slide_layouts(
+    service, presentation_id: str, requests: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Resolve predefinedLayout references in createSlide requests to actual layout IDs.
+
+    Presentations with custom themes may not have standard predefined layouts.
+    This function fetches the presentation's actual layouts and replaces
+    predefinedLayout with a layoutObjectId where possible.
+    """
+    # Early return if no createSlide requests use predefinedLayout
+    if not any(
+        "predefinedLayout" in req.get("createSlide", {}).get("slideLayoutReference", {})
+        for req in requests
+    ):
+        return requests
+
+    layout_map = await _get_presentation_layouts(service, presentation_id)
+
+    resolved = []
+    for req in requests:
+        if "createSlide" not in req:
+            resolved.append(req)
+            continue
+
+        create_slide = req["createSlide"]
+        layout_ref = create_slide.get("slideLayoutReference", {})
+        predefined = layout_ref.get("predefinedLayout")
+
+        if not predefined or "layoutObjectId" in layout_ref:
+            resolved.append(req)
+            continue
+
+        if predefined in layout_map:
+            new_req = copy.deepcopy(req)
+            new_ref = new_req["createSlide"]["slideLayoutReference"]
+            del new_ref["predefinedLayout"]
+            new_ref["layoutObjectId"] = layout_map[predefined]
+            resolved.append(new_req)
+            logger.info(
+                f"[batch_update_presentation] Resolved predefinedLayout '{predefined}' "
+                f"to layoutObjectId '{layout_map[predefined]}'"
+            )
+        else:
+            # Layout not found — pass through unchanged and let the Slides API
+            # surface the real error rather than silently mutating the request.
+            resolved.append(req)
+            logger.warning(
+                f"[batch_update_presentation] predefinedLayout '{predefined}' not found "
+                f"in presentation masters. Available: {list(layout_map.keys())}. "
+                f"Passing request as-is."
+            )
+
+    return resolved
 
 
 @server.tool()
@@ -170,6 +281,10 @@ async def batch_update_presentation(
     logger.info(
         f"[batch_update_presentation] Invoked. Email: '{user_google_email}', ID: '{presentation_id}', Requests: {len(requests)}"
     )
+
+    # Resolve predefinedLayout references to actual layout IDs for
+    # presentations that use custom themes/masters.
+    requests = await _resolve_create_slide_layouts(service, presentation_id, requests)
 
     body = {"requests": requests}
 
