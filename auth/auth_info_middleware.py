@@ -40,13 +40,13 @@ class AuthInfoMiddleware(Middleware):
         try:
             access_token = get_access_token()
             if access_token:
-                logger.info("[AuthInfoMiddleware] FastMCP access_token found")
+                logger.debug("[AuthInfoMiddleware] FastMCP access_token found")
                 user_email = getattr(access_token, "email", None)
                 if not user_email and hasattr(access_token, "claims"):
                     user_email = access_token.claims.get("email")
 
                 if user_email:
-                    logger.info(
+                    logger.debug(
                         f"✓ Using FastMCP validated token for user: {user_email}"
                     )
                     await context.fastmcp_context.set_state(
@@ -72,7 +72,7 @@ class AuthInfoMiddleware(Middleware):
             try:
                 # Use the new FastMCP method to get HTTP headers
                 headers = get_http_headers()
-                logger.info(
+                logger.debug(
                     f"[AuthInfoMiddleware] get_http_headers() returned: {headers is not None}, keys: {list(headers.keys()) if headers else 'None'}"
                 )
                 if headers:
@@ -82,7 +82,7 @@ class AuthInfoMiddleware(Middleware):
                     auth_header = headers.get("authorization", "")
                     if auth_header.startswith("Bearer "):
                         token_str = auth_header[7:]  # Remove "Bearer " prefix
-                        logger.info("Found Bearer token in request")
+                        logger.debug("Found Bearer token in request")
 
                         # For Google OAuth tokens (ya29.*), we need to verify them differently
                         if token_str.startswith("ya29."):
@@ -325,7 +325,7 @@ class AuthInfoMiddleware(Middleware):
 
         # Single exit point with logging
         if authenticated_user:
-            logger.info(f"✓ Authenticated via {auth_via}: {authenticated_user}")
+            logger.debug(f"✓ Authenticated via {auth_via}: {authenticated_user}")
             auth_email = await context.fastmcp_context.get_state(
                 "authenticated_user_email"
             )
