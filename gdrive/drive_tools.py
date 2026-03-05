@@ -9,8 +9,10 @@ import logging
 import io
 import httpx
 import base64
+import binascii
 import ipaddress
 import socket
+import uuid
 from contextlib import asynccontextmanager
 
 from typing import AsyncIterator, Optional, List, Dict, Any
@@ -581,32 +583,36 @@ async def create_drive_file(
     service,
     user_google_email: str,
     file_name: str,
-    content: Optional[str] = None,  # Now explicitly Optional
+    content: Optional[str] = None,
     folder_id: str = "root",
     mime_type: str = "text/plain",
-    fileUrl: Optional[str] = None,  # Now explicitly Optional
+    fileUrl: Optional[str] = None,
+    upload_id: Optional[str] = None,
+    file_content_base64: Optional[str] = None,
 ) -> str:
     """
     Creates a new file in Google Drive, supporting creation within shared drives.
-    Accepts either direct content or a fileUrl to fetch the content from.
+    Accepts content via text, URL, upload_id (from POST /upload), or base64-encoded data.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
         file_name (str): The name for the new file.
-        content (Optional[str]): If provided, the content to write to the file.
+        content (Optional[str]): If provided, the text content to write to the file.
         folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
         mime_type (str): The MIME type of the file. Defaults to 'text/plain'.
         fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.
+        upload_id (Optional[str]): If provided, uses a file previously uploaded via the POST /upload endpoint. Best for binary files from remote clients.
+        file_content_base64 (Optional[str]): If provided, base64-encoded file content. Useful for binary files when POST /upload is not available.
 
     Returns:
         str: Confirmation message of the successful file creation with file link.
     """
     logger.info(
-        f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}"
+        f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}, upload_id: {upload_id}"
     )
 
-    if content is None and fileUrl is None and mime_type != FOLDER_MIME_TYPE:
-        raise Exception("You must provide either 'content' or 'fileUrl'.")
+    if content is None and fileUrl is None and upload_id is None and file_content_base64 is None and mime_type != FOLDER_MIME_TYPE:
+        raise Exception("You must provide either 'content', 'fileUrl', 'upload_id', or 'file_content_base64'.")
 
     # Create folder (no content or media_body). Prefer create_drive_folder for new code.
     if mime_type == FOLDER_MIME_TYPE:
@@ -623,8 +629,79 @@ async def create_drive_file(
         "mimeType": mime_type,
     }
 
-    # Prefer fileUrl if both are provided
-    if fileUrl:
+    # Priority: upload_id > file_content_base64 > fileUrl > content
+    if upload_id:
+        logger.info(f"[create_drive_file] Using upload_id: {upload_id}")
+        try:
+            uuid.UUID(upload_id, version=4)
+        except ValueError:
+            raise Exception(f"Invalid upload_id format: {upload_id}")
+
+        storage = get_attachment_storage()
+        upload_path = storage.get_attachment_path(upload_id)
+        if upload_path is None:
+            raise Exception(
+                f"Upload not found or expired for upload_id: {upload_id}. "
+                "Upload files via POST /upload first."
+            )
+
+        upload_meta = storage.get_attachment_metadata(upload_id)
+        stored_mime = upload_meta.get("mime_type") if upload_meta else None
+        if stored_mime and stored_mime != "application/octet-stream" and mime_type == "text/plain":
+            mime_type = stored_mime
+            file_metadata["mimeType"] = mime_type
+
+        try:
+            file_data = upload_path.read_bytes()
+        except OSError as e:
+            raise Exception(
+                f"Upload file could not be read (may have expired): {e}"
+            )
+        logger.info(f"[create_drive_file] Read {len(file_data)} bytes from upload")
+
+        media = MediaIoBaseUpload(
+            io.BytesIO(file_data),
+            mimetype=mime_type,
+            resumable=True,
+            chunksize=UPLOAD_CHUNK_SIZE_BYTES,
+        )
+
+        created_file = await asyncio.to_thread(
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute
+        )
+    elif file_content_base64:
+        logger.info(f"[create_drive_file] Decoding base64 content ({len(file_content_base64)} chars)")
+        try:
+            file_data = base64.b64decode(file_content_base64)
+        except (ValueError, binascii.Error) as e:
+            raise Exception(f"Invalid base64 data: {e}")
+        logger.info(f"[create_drive_file] Decoded {len(file_data)} bytes from base64")
+
+        media = MediaIoBaseUpload(
+            io.BytesIO(file_data),
+            mimetype=mime_type,
+            resumable=True,
+            chunksize=UPLOAD_CHUNK_SIZE_BYTES,
+        )
+
+        created_file = await asyncio.to_thread(
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute
+        )
+    elif fileUrl:
         logger.info(f"[create_drive_file] Fetching file from URL: {fileUrl}")
 
         # Check if this is a file:// URL

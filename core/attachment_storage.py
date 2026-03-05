@@ -45,6 +45,25 @@ class AttachmentStorage:
         self.expiration_seconds = expiration_seconds
         self._metadata: Dict[str, Dict] = {}
 
+    def save_bytes(
+        self,
+        file_bytes: bytes,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+    ) -> SavedAttachment:
+        """
+        Save raw bytes to local disk.
+
+        Args:
+            file_bytes: Raw file bytes
+            filename: Original filename (optional)
+            mime_type: MIME type (optional)
+
+        Returns:
+            SavedAttachment with file_id (UUID) and path (absolute file path)
+        """
+        return self._save(file_bytes, filename, mime_type)
+
     def save_attachment(
         self,
         base64_data: str,
@@ -62,17 +81,26 @@ class AttachmentStorage:
         Returns:
             SavedAttachment with file_id (UUID) and path (absolute file path)
         """
-        _ensure_storage_dir()
-
-        # Generate unique file ID for metadata tracking
-        file_id = str(uuid.uuid4())
-
         # Decode base64 data
         try:
             file_bytes = base64.urlsafe_b64decode(base64_data)
         except Exception as e:
             logger.error(f"Failed to decode base64 attachment data: {e}")
             raise ValueError(f"Invalid base64 data: {e}")
+
+        return self._save(file_bytes, filename, mime_type)
+
+    def _save(
+        self,
+        file_bytes: bytes,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+    ) -> SavedAttachment:
+        """Internal helper to save bytes to disk."""
+        _ensure_storage_dir()
+
+        # Generate unique file ID for metadata tracking
+        file_id = str(uuid.uuid4())
 
         # Determine file extension from filename or mime type
         extension = ""
@@ -91,16 +119,18 @@ class AttachmentStorage:
             }
             extension = mime_to_ext.get(mime_type, "")
 
-        # Use original filename if available, with UUID suffix for uniqueness
+        # Use original filename if available, with UUID suffix for uniqueness.
+        # Sanitize to prevent path traversal: extract only the final component.
         if filename:
-            stem = Path(filename).stem
-            ext = Path(filename).suffix
-            save_name = f"{stem}_{file_id[:8]}{ext}"
+            safe = Path(Path(filename).name)  # strips any directory components
+            save_name = f"{safe.stem}_{file_id[:8]}{safe.suffix}"
         else:
             save_name = f"{file_id}{extension}"
 
         # Save file with restrictive permissions (sensitive email/drive content)
-        file_path = STORAGE_DIR / save_name
+        file_path = (STORAGE_DIR / save_name).resolve()
+        if not file_path.is_relative_to(STORAGE_DIR):
+            raise ValueError("Invalid filename: path escapes storage directory")
         try:
             fd = os.open(
                 file_path,
@@ -131,14 +161,14 @@ class AttachmentStorage:
             raise
 
         # Store metadata
-        expires_at = datetime.now() + timedelta(seconds=self.expiration_seconds)
+        now = datetime.now()
         self._metadata[file_id] = {
             "file_path": str(file_path),
             "filename": filename or f"attachment{extension}",
             "mime_type": mime_type or "application/octet-stream",
             "size": len(file_bytes),
-            "created_at": datetime.now(),
-            "expires_at": expires_at,
+            "created_at": now,
+            "expires_at": now + timedelta(seconds=self.expiration_seconds),
         }
 
         return SavedAttachment(file_id=file_id, path=str(file_path))

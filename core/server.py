@@ -481,6 +481,68 @@ async def health_check(request: Request):
     )
 
 
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB upload limit
+MAX_UPLOAD_MB = MAX_UPLOAD_BYTES // (1024 * 1024)
+
+
+@server.custom_route("/upload", methods=["POST"])
+async def upload_file(request: Request):
+    """Accept a multipart file upload and return an upload_id for use with create_drive_file."""
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type:
+        return JSONResponse(
+            {"error": "Content-Type must be multipart/form-data"}, status_code=400
+        )
+
+    # Reject oversized requests early before buffering the body
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_UPLOAD_BYTES:
+                return JSONResponse(
+                    {"error": f"File exceeds {MAX_UPLOAD_MB} MB limit"},
+                    status_code=413,
+                )
+        except ValueError:
+            pass
+
+    try:
+        form = await request.form()
+        uploaded_file = form.get("file")
+        if uploaded_file is None:
+            return JSONResponse(
+                {"error": "Missing required 'file' field"}, status_code=400
+            )
+
+        file_bytes = await uploaded_file.read()
+        if len(file_bytes) > MAX_UPLOAD_BYTES:
+            return JSONResponse(
+                {"error": f"File exceeds {MAX_UPLOAD_MB} MB limit"},
+                status_code=413,
+            )
+
+        filename = uploaded_file.filename or form.get("filename")
+        mime_type = uploaded_file.content_type or form.get("mime_type")
+
+        from core.attachment_storage import get_attachment_storage
+
+        storage = get_attachment_storage()
+        result = storage.save_bytes(file_bytes, filename=filename, mime_type=mime_type)
+
+        logger.info(
+            f"File uploaded: upload_id={result.file_id}, filename={filename}, size={len(file_bytes)}"
+        )
+        return JSONResponse({
+            "upload_id": result.file_id,
+            "filename": filename,
+            "size": len(file_bytes),
+            "mime_type": mime_type,
+        })
+    except Exception as e:
+        logger.error(f"Upload failed: {e}", exc_info=True)
+        return JSONResponse({"error": "Upload failed"}, status_code=500)
+
+
 @server.custom_route("/attachments/{file_id}", methods=["GET"])
 async def serve_attachment(request: Request):
     """Serve a stored attachment file."""
