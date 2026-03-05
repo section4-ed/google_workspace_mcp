@@ -645,6 +645,23 @@ async def insert_doc_elements(
         logger.debug("Adjusting index from 0 to 1 to avoid first section break")
         index = 1
 
+    # Clamp index to the valid range: the Docs API requires index < body endIndex.
+    # Callers (especially AI models) often pass the endIndex itself when targeting
+    # the end of the document, which causes a 400 error.
+    doc = await asyncio.to_thread(
+        service.documents()
+        .get(documentId=document_id, fields="body.content")
+        .execute
+    )
+    body_content = doc.get("body", {}).get("content", [])
+    if body_content:
+        body_end_index = body_content[-1].get("endIndex", 1)
+        if index >= body_end_index:
+            index = body_end_index - 1
+            logger.debug(
+                f"Clamped index to {index} (body endIndex={body_end_index})"
+            )
+
     requests = []
 
     if element_type == "table":
@@ -732,6 +749,21 @@ async def insert_doc_image(
     if index == 0:
         logger.debug("Adjusting index from 0 to 1 to avoid first section break")
         index = 1
+
+    # Clamp index to valid range (same as insert_doc_elements)
+    doc = await asyncio.to_thread(
+        docs_service.documents()
+        .get(documentId=document_id, fields="body.content")
+        .execute
+    )
+    body_content = doc.get("body", {}).get("content", [])
+    if body_content:
+        body_end_index = body_content[-1].get("endIndex", 1)
+        if index >= body_end_index:
+            index = body_end_index - 1
+            logger.debug(
+                f"Clamped index to {index} (body endIndex={body_end_index})"
+            )
 
     # Determine if source is a Drive file ID or URL
     is_drive_file = not (
