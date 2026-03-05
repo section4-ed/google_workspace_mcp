@@ -6,6 +6,7 @@ services:
       - "8000:8000"
     environment:
       - GOOGLE_MCP_CREDENTIALS_DIR=/app/store_creds
+      - FASTMCP_HOME=/app/store_creds/.fastmcp
     volumes:
       - store_creds:/app/store_creds:rw
     env_file:
