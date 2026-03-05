@@ -216,6 +216,49 @@ class OAuth21SessionStore:
                 state[:8] if len(state) > 8 else state,
             )
 
+    def _trim_stale_mappings(self) -> int:
+        """Remove stale MCP session and auth binding entries. Caller must hold lock.
+
+        In stateless HTTP mode, every request creates a new MCP session ID,
+        causing _mcp_session_mapping and _session_auth_binding to grow without
+        bound.  This method keeps only session IDs referenced by current user
+        sessions and discards the rest.
+
+        Returns:
+            Number of stale entries removed.
+        """
+        # Collect session IDs still referenced by active user sessions
+        active_ids: set[str] = set()
+        for session_info in self._sessions.values():
+            sid = session_info.get("session_id")
+            mcp_sid = session_info.get("mcp_session_id")
+            if sid:
+                active_ids.add(sid)
+            if mcp_sid:
+                active_ids.add(mcp_sid)
+
+        # If no active sessions exist (e.g. external provider mode), skip
+        # trimming to avoid wiping all bindings.
+        if not active_ids:
+            return 0
+
+        stale_mcp = [k for k in self._mcp_session_mapping if k not in active_ids]
+        for k in stale_mcp:
+            del self._mcp_session_mapping[k]
+
+        stale_binding = [k for k in self._session_auth_binding if k not in active_ids]
+        for k in stale_binding:
+            del self._session_auth_binding[k]
+
+        removed = len(stale_mcp) + len(stale_binding)
+        if removed > 0:
+            logger.debug(
+                "Trimmed stale session mappings: %d mcp, %d bindings removed",
+                len(stale_mcp),
+                len(stale_binding),
+            )
+        return removed
+
     def store_oauth_state(
         self,
         state: str,
@@ -373,7 +416,7 @@ class OAuth21SessionStore:
                 # Create immutable session binding (first binding wins, cannot be changed)
                 if mcp_session_id not in self._session_auth_binding:
                     self._session_auth_binding[mcp_session_id] = user_email
-                    logger.info(
+                    logger.debug(
                         f"Created immutable session binding: {mcp_session_id} -> {user_email}"
                     )
                 elif self._session_auth_binding[mcp_session_id] != user_email:
@@ -386,17 +429,22 @@ class OAuth21SessionStore:
                     )
 
                 self._mcp_session_mapping[mcp_session_id] = user_email
-                logger.info(
+                logger.debug(
                     f"Stored OAuth 2.1 session for {user_email} (session_id: {session_id}, mcp_session_id: {mcp_session_id})"
                 )
             else:
-                logger.info(
+                logger.debug(
                     f"Stored OAuth 2.1 session for {user_email} (session_id: {session_id})"
                 )
 
             # Also create binding for the OAuth session ID
             if session_id and session_id not in self._session_auth_binding:
                 self._session_auth_binding[session_id] = user_email
+
+            # Prevent unbounded growth of session mappings in stateless HTTP
+            # mode (each request creates a new MCP session ID).
+            if len(self._mcp_session_mapping) > 500:
+                self._trim_stale_mappings()
 
     def get_credentials(self, user_email: str) -> Optional[Credentials]:
         """
@@ -574,7 +622,7 @@ class OAuth21SessionStore:
         with self._lock:
             if user_email in self._sessions:
                 # Get session IDs to clean up mappings
-                session_info = self._sessions.get(user_email, {})
+                session_info = self._sessions[user_email]
                 mcp_session_id = session_info.get("mcp_session_id")
                 session_id = session_info.get("session_id")
 
@@ -599,7 +647,7 @@ class OAuth21SessionStore:
                     logger.info(f"Removed OAuth 2.1 session for {user_email}")
 
             # Clean up any orphaned mappings that may have accumulated
-            self._cleanup_orphaned_mappings_locked()
+            self._trim_stale_mappings()
 
     def has_session(self, user_email: str) -> bool:
         """Check if a user has an active session."""
@@ -644,43 +692,6 @@ class OAuth21SessionStore:
                     return session_info.get("session_id") or f"bearer_{user_email}"
             return None
 
-    def _cleanup_orphaned_mappings_locked(self) -> int:
-        """Remove orphaned mappings. Caller must hold lock."""
-        # Collect valid session IDs and mcp_session_ids from active sessions
-        valid_session_ids = set()
-        valid_mcp_session_ids = set()
-        for session_info in self._sessions.values():
-            if session_info.get("session_id"):
-                valid_session_ids.add(session_info["session_id"])
-            if session_info.get("mcp_session_id"):
-                valid_mcp_session_ids.add(session_info["mcp_session_id"])
-
-        removed = 0
-
-        # Remove orphaned MCP session mappings
-        orphaned_mcp = [
-            sid for sid in self._mcp_session_mapping if sid not in valid_mcp_session_ids
-        ]
-        for sid in orphaned_mcp:
-            del self._mcp_session_mapping[sid]
-            removed += 1
-            logger.debug(f"Removed orphaned MCP session mapping: {sid}")
-
-        # Remove orphaned auth bindings
-        valid_bindings = valid_session_ids | valid_mcp_session_ids
-        orphaned_bindings = [
-            sid for sid in self._session_auth_binding if sid not in valid_bindings
-        ]
-        for sid in orphaned_bindings:
-            del self._session_auth_binding[sid]
-            removed += 1
-            logger.debug(f"Removed orphaned auth binding: {sid}")
-
-        if removed > 0:
-            logger.info(f"Cleaned up {removed} orphaned session mappings/bindings")
-
-        return removed
-
     def cleanup_orphaned_mappings(self) -> int:
         """
         Remove orphaned entries from mcp_session_mapping and session_auth_binding.
@@ -689,7 +700,7 @@ class OAuth21SessionStore:
             Number of orphaned entries removed
         """
         with self._lock:
-            return self._cleanup_orphaned_mappings_locked()
+            return self._trim_stale_mappings()
 
 
 # Global instance

@@ -1,10 +1,10 @@
 import inspect
 import logging
-
 import re
+import time
 from functools import wraps
 from typing import Dict, List, Optional, Any, Callable, Union, Tuple
-from contextlib import ExitStack
+from threading import RLock
 
 from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
@@ -60,6 +60,95 @@ from auth.scopes import (
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Service cache — avoids re-running build() on every tool call
+# ---------------------------------------------------------------------------
+
+# TTL for cached service objects (seconds). Google access tokens typically
+# last 1 hour; we evict sooner to avoid using stale HTTP transports.
+_SERVICE_CACHE_TTL = 30 * 60  # 30 minutes
+_SERVICE_CACHE_MAX_SIZE = 50  # per-process cap
+
+
+class _CachedEntry:
+    __slots__ = ("service", "refresh_token", "created_at")
+
+    def __init__(self, service, refresh_token: Optional[str], created_at: float):
+        self.service = service
+        self.refresh_token = refresh_token
+        self.created_at = created_at
+
+
+class _ServiceCache:
+    """Thread-safe LRU-ish cache for Google API service objects.
+
+    Key: (user_email, service_name, version)
+    Value: _CachedEntry holding the `build()` result + credentials metadata.
+
+    A cache hit is valid when:
+    - The entry hasn't exceeded TTL.
+    - The refresh_token hasn't changed (same credential session).
+    """
+
+    def __init__(self, ttl: int = _SERVICE_CACHE_TTL, max_size: int = _SERVICE_CACHE_MAX_SIZE):
+        self._cache: Dict[tuple, _CachedEntry] = {}
+        self._lock = RLock()
+        self._ttl = ttl
+        self._max_size = max_size
+
+    def get(
+        self, user_email: str, service_name: str, version: str, refresh_token: Optional[str]
+    ) -> Optional[Any]:
+        key = (user_email, service_name, version)
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            if time.monotonic() - entry.created_at > self._ttl:
+                self._evict(key)
+                return None
+            if entry.refresh_token != refresh_token:
+                # Credentials changed (re-auth), discard cached service.
+                self._evict(key)
+                return None
+            logger.debug(
+                "[ServiceCache] HIT %s/%s for %s", service_name, version, user_email
+            )
+            return entry.service
+
+    def put(
+        self,
+        user_email: str,
+        service_name: str,
+        version: str,
+        service: Any,
+        refresh_token: Optional[str],
+    ) -> None:
+        key = (user_email, service_name, version)
+        with self._lock:
+            # Evict oldest entries if over capacity
+            while len(self._cache) >= self._max_size:
+                oldest_key = min(self._cache, key=lambda k: self._cache[k].created_at)
+                self._evict(oldest_key)
+            self._cache[key] = _CachedEntry(service, refresh_token, time.monotonic())
+            logger.debug(
+                "[ServiceCache] STORE %s/%s for %s", service_name, version, user_email
+            )
+
+    def _evict(self, key: tuple) -> None:
+        self._cache.pop(key, None)
+
+    def invalidate_user(self, user_email: str) -> None:
+        """Remove all cached services for a user (e.g. on re-auth)."""
+        with self._lock:
+            keys_to_remove = [k for k in self._cache if k[0] == user_email]
+            for k in keys_to_remove:
+                self._evict(k)
+
+
+_service_cache = _ServiceCache()
+
+
 # Authentication helper functions
 async def _get_auth_context(
     tool_name: str,
@@ -82,7 +171,7 @@ async def _get_auth_context(
         if mcp_session_id:
             set_fastmcp_session_id(mcp_session_id)
 
-        logger.info(
+        logger.debug(
             f"[{tool_name}] Auth from middleware: authenticated_user={authenticated_user}, auth_method={auth_method}, session_id={mcp_session_id}"
         )
         return authenticated_user, auth_method, mcp_session_id
@@ -106,7 +195,7 @@ def _detect_oauth_version(
 
     # When OAuth 2.1 is enabled globally, ALWAYS use OAuth 2.1 for authenticated users
     if authenticated_user:
-        logger.info(
+        logger.debug(
             f"[{tool_name}] OAuth 2.1 mode: Using OAuth 2.1 for authenticated user '{authenticated_user}'"
         )
         return True
@@ -115,7 +204,7 @@ def _detect_oauth_version(
     # be available even if middleware state wasn't populated.
     try:
         if get_access_token() is not None:
-            logger.info(
+            logger.debug(
                 f"[{tool_name}] OAuth 2.1 mode: Using OAuth 2.1 based on validated access token"
             )
             return True
@@ -281,8 +370,16 @@ async def get_authenticated_google_service_oauth21(
                 f"OAuth credentials lack required scopes. Need: {required_scopes}, Have: {sorted(scopes_available)}"
             )
 
+        refresh_token = credentials.refresh_token
+        cached = _service_cache.get(resolved_email, service_name, version, refresh_token)
+        if cached is not None:
+            logger.debug(f"[{tool_name}] Reusing cached {service_name} for {resolved_email}")
+            return cached, resolved_email
+
         service = build(service_name, version, credentials=credentials)
-        logger.info(f"[{tool_name}] Authenticated {service_name} for {resolved_email}")
+        if refresh_token:
+            _service_cache.put(resolved_email, service_name, version, service, refresh_token)
+        logger.debug(f"[{tool_name}] Authenticated {service_name} for {resolved_email}")
         return service, resolved_email
 
     store = get_oauth21_session_store()
@@ -311,8 +408,16 @@ async def get_authenticated_google_service_oauth21(
             f"OAuth 2.1 credentials lack required scopes. Need: {required_scopes}, Have: {sorted(scopes_available)}"
         )
 
+    refresh_token = credentials.refresh_token
+    cached = _service_cache.get(user_google_email, service_name, version, refresh_token)
+    if cached is not None:
+        logger.debug(f"[{tool_name}] Reusing cached {service_name} for {user_google_email}")
+        return cached, user_google_email
+
     service = build(service_name, version, credentials=credentials)
-    logger.info(f"[{tool_name}] Authenticated {service_name} for {user_google_email}")
+    if refresh_token:
+        _service_cache.put(user_google_email, service_name, version, service, refresh_token)
+    logger.debug(f"[{tool_name}] Authenticated {service_name} for {user_google_email}")
 
     return service, user_google_email
 
@@ -468,18 +573,9 @@ SCOPE_GROUPS = {
 def _resolve_scopes(scopes: Union[str, List[str]]) -> List[str]:
     """Resolve scope names to actual scope URLs."""
     if isinstance(scopes, str):
-        if scopes in SCOPE_GROUPS:
-            return [SCOPE_GROUPS[scopes]]
-        else:
-            return [scopes]
+        return [SCOPE_GROUPS.get(scopes, scopes)]
 
-    resolved = []
-    for scope in scopes:
-        if scope in SCOPE_GROUPS:
-            resolved.append(SCOPE_GROUPS[scope])
-        else:
-            resolved.append(scope)
-    return resolved
+    return [SCOPE_GROUPS.get(scope, scope) for scope in scopes]
 
 
 def _handle_token_refresh_error(
@@ -687,13 +783,12 @@ def require_google_service(
                 # Prepend the fetched service object to the original arguments
                 return await func(service, *args, **kwargs)
             except RefreshError as e:
+                # Invalidate cached service on token refresh failure
+                _service_cache.invalidate_user(actual_user_email)
                 error_message = _handle_token_refresh_error(
                     e, actual_user_email, service_name
                 )
                 raise GoogleAuthenticationError(error_message)
-            finally:
-                if service:
-                    service.close()
 
         # Set the wrapper's signature to the one without 'service'
         wrapper.__signature__ = wrapper_sig
@@ -767,76 +862,74 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
                 )
 
             # Authenticate all services
-            with ExitStack() as stack:
-                for config in service_configs:
-                    service_type = config["service_type"]
-                    scopes = config["scopes"]
-                    param_name = config["param_name"]
-                    version = config.get("version")
+            for config in service_configs:
+                service_type = config["service_type"]
+                scopes = config["scopes"]
+                param_name = config["param_name"]
+                version = config.get("version")
 
-                    if service_type not in SERVICE_CONFIGS:
-                        raise Exception(f"Unknown service type: {service_type}")
+                if service_type not in SERVICE_CONFIGS:
+                    raise Exception(f"Unknown service type: {service_type}")
 
-                    service_config = SERVICE_CONFIGS[service_type]
-                    service_name = service_config["service"]
-                    service_version = version or service_config["version"]
-                    resolved_scopes = _resolve_scopes(scopes)
+                service_config = SERVICE_CONFIGS[service_type]
+                service_name = service_config["service"]
+                service_version = version or service_config["version"]
+                resolved_scopes = _resolve_scopes(scopes)
 
-                    try:
-                        # Detect OAuth version (simplified for multiple services)
-                        use_oauth21 = (
-                            is_oauth21_enabled() and authenticated_user is not None
-                        )
-
-                        # In OAuth 2.0 mode, we may need to override user_google_email
-                        if not is_oauth21_enabled():
-                            user_google_email, args = _override_oauth21_user_email(
-                                use_oauth21,
-                                authenticated_user,
-                                user_google_email,
-                                args,
-                                kwargs,
-                                wrapper_param_names,
-                                tool_name,
-                                service_type,
-                            )
-
-                        # Authenticate service
-                        service, _ = await _authenticate_service(
-                            use_oauth21,
-                            service_name,
-                            service_version,
-                            tool_name,
-                            user_google_email,
-                            resolved_scopes,
-                            mcp_session_id,
-                            authenticated_user,
-                        )
-
-                        # Inject service with specified parameter name
-                        kwargs[param_name] = service
-                        stack.callback(service.close)
-
-                    except GoogleAuthenticationError as e:
-                        logger.error(
-                            f"[{tool_name}] GoogleAuthenticationError for service '{service_type}' (user: {user_google_email}): {e}"
-                        )
-                        # Re-raise the original error without wrapping it
-                        raise
-
-                # Call the original function with refresh error handling
                 try:
-                    # In OAuth 2.1 mode, we need to add user_google_email to kwargs since it was removed from signature
-                    if is_oauth21_enabled():
-                        kwargs["user_google_email"] = user_google_email
-
-                    return await func(*args, **kwargs)
-                except RefreshError as e:
-                    # Handle token refresh errors gracefully
-                    error_message = _handle_token_refresh_error(
-                        e, user_google_email, "Multiple Services"
+                    # Detect OAuth version (simplified for multiple services)
+                    use_oauth21 = (
+                        is_oauth21_enabled() and authenticated_user is not None
                     )
-                    raise GoogleAuthenticationError(error_message)
+
+                    # In OAuth 2.0 mode, we may need to override user_google_email
+                    if not is_oauth21_enabled():
+                        user_google_email, args = _override_oauth21_user_email(
+                            use_oauth21,
+                            authenticated_user,
+                            user_google_email,
+                            args,
+                            kwargs,
+                            wrapper_param_names,
+                            tool_name,
+                            service_type,
+                        )
+
+                    # Authenticate service
+                    service, _ = await _authenticate_service(
+                        use_oauth21,
+                        service_name,
+                        service_version,
+                        tool_name,
+                        user_google_email,
+                        resolved_scopes,
+                        mcp_session_id,
+                        authenticated_user,
+                    )
+
+                    # Inject service with specified parameter name
+                    kwargs[param_name] = service
+
+                except GoogleAuthenticationError as e:
+                    logger.error(
+                        f"[{tool_name}] GoogleAuthenticationError for service '{service_type}' (user: {user_google_email}): {e}"
+                    )
+                    # Re-raise the original error without wrapping it
+                    raise
+
+            # Call the original function with refresh error handling
+            try:
+                # In OAuth 2.1 mode, we need to add user_google_email to kwargs since it was removed from signature
+                if is_oauth21_enabled():
+                    kwargs["user_google_email"] = user_google_email
+
+                return await func(*args, **kwargs)
+            except RefreshError as e:
+                _service_cache.invalidate_user(user_google_email)
+                error_message = _handle_token_refresh_error(
+                    e, user_google_email, "Multiple Services"
+                )
+                raise GoogleAuthenticationError(error_message)
 
         # Set the wrapper's signature
         wrapper.__signature__ = wrapper_sig
@@ -850,10 +943,11 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
                 wrapper.__doc__ = _remove_user_email_arg_from_docstring(func.__doc__)
 
         # Attach all required scopes to the wrapper for tool filtering
-        all_scopes = []
-        for config in service_configs:
-            all_scopes.extend(_resolve_scopes(config["scopes"]))
-        wrapper._required_google_scopes = all_scopes
+        wrapper._required_google_scopes = [
+            scope
+            for config in service_configs
+            for scope in _resolve_scopes(config["scopes"])
+        ]
 
         return wrapper
 

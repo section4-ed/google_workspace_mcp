@@ -36,6 +36,17 @@ from core.config import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+class _HealthCheckFilter(logging.Filter):
+    """Suppress Uvicorn access-log entries for health check endpoints."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "GET /health " not in msg and "GET / " not in msg
+
+
+logging.getLogger("uvicorn.access").addFilter(_HealthCheckFilter())
+
 _auth_provider: Optional[GoogleProvider] = None
 _legacy_callback_registered = False
 
