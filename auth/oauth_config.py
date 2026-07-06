@@ -14,6 +14,27 @@ from urllib.parse import urlparse
 from typing import List, Optional, Dict, Any
 
 
+# Default allow-list of MCP client redirect URI patterns (fnmatch globs) for the
+# OAuth proxy. FastMCP's OAuthProxy accepts ANY client redirect_uri when no
+# allow-list is set, which enabled OAuth consent-phishing to an attacker-controlled
+# endpoint (SwarmSec #154). We always pass an explicit list; operators should
+# narrow it to the exact first-party clients they use via
+# MCP_ALLOWED_CLIENT_REDIRECT_URIS. This conservative default covers loopback
+# (native/desktop clients) plus the common hosted MCP clients.
+DEFAULT_ALLOWED_CLIENT_REDIRECT_URIS = [
+    "http://localhost:*",
+    "http://127.0.0.1:*",
+    "https://claude.ai/*",
+    "https://claude.com/*",
+    "https://*.anthropic.com/*",
+    "https://vscode.dev/*",
+    "https://insiders.vscode.dev/*",
+    "vscode://*",
+    "vscode-insiders://*",
+    "cursor://*",
+]
+
+
 class OAuthConfig:
     """
     Centralized OAuth configuration management.
@@ -167,6 +188,34 @@ class OAuthConfig:
             origins.extend([origin.strip() for origin in custom_origins.split(",")])
 
         return list(dict.fromkeys(origins))
+
+    def get_allowed_client_redirect_uris(self) -> List[str]:
+        """Allow-list of MCP client redirect URI patterns for the OAuth proxy.
+
+        FastMCP's OAuthProxy accepts ANY client redirect_uri when this is unset,
+        which enables OAuth consent-phishing to an attacker endpoint (SwarmSec
+        #154). We therefore always pass an explicit allow-list. Set
+        MCP_ALLOWED_CLIENT_REDIRECT_URIS (comma-separated fnmatch patterns) to the
+        exact first-party clients in use; otherwise
+        DEFAULT_ALLOWED_CLIENT_REDIRECT_URIS applies (loopback + common hosted
+        MCP clients).
+        """
+        custom = os.getenv("MCP_ALLOWED_CLIENT_REDIRECT_URIS")
+        if custom:
+            patterns = [p.strip() for p in custom.split(",") if p.strip()]
+            if patterns:
+                return patterns
+        return list(DEFAULT_ALLOWED_CLIENT_REDIRECT_URIS)
+
+    def get_allowed_hosted_domain(self) -> Optional[str]:
+        """Google Workspace hosted-domain (hd) constraining who may complete the
+        OAuth flow. When GOOGLE_ALLOWED_HOSTED_DOMAIN is set (e.g. "sectionai.com"),
+        it is forwarded to Google's authorization endpoint so accounts outside the
+        domain are not offered a consent screen (SwarmSec #154, defense in depth).
+        Unset = no hd restriction.
+        """
+        domain = os.getenv("GOOGLE_ALLOWED_HOSTED_DOMAIN")
+        return domain.strip() if domain and domain.strip() else None
 
     def is_configured(self) -> bool:
         """

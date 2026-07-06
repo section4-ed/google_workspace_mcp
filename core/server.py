@@ -438,7 +438,18 @@ def configure_server_for_http():
                     "Protected resource metadata points to Google's authorization server"
                 )
             else:
-                # Standard OAuth 2.1 mode: use FastMCP's GoogleProvider
+                # Standard OAuth 2.1 mode: use FastMCP's GoogleProvider.
+                # Restrict which client redirect URIs the OAuth proxy will accept.
+                # FastMCP accepts ANY redirect_uri when allowed_client_redirect_uris
+                # is unset, which enabled OAuth consent-phishing to an attacker
+                # endpoint via open Dynamic Client Registration (SwarmSec #154).
+                # hd (when configured) additionally limits the flow to a single
+                # Google Workspace domain.
+                allowed_client_redirect_uris = config.get_allowed_client_redirect_uris()
+                allowed_hosted_domain = config.get_allowed_hosted_domain()
+                extra_authorize_params = (
+                    {"hd": allowed_hosted_domain} if allowed_hosted_domain else None
+                )
                 provider = GoogleProvider(
                     client_id=config.client_id,
                     client_secret=config.client_secret,
@@ -447,11 +458,16 @@ def configure_server_for_http():
                     required_scopes=required_scopes,
                     client_storage=client_storage,
                     jwt_signing_key=jwt_signing_key,
+                    allowed_client_redirect_uris=allowed_client_redirect_uris,
+                    extra_authorize_params=extra_authorize_params,
                 )
                 # Enable protocol-level auth
                 server.auth = provider
                 logger.info(
-                    "OAuth 2.1 enabled using FastMCP GoogleProvider with protocol-level auth"
+                    "OAuth 2.1 enabled using FastMCP GoogleProvider with protocol-level auth "
+                    "(client redirect_uri allow-list: %d pattern(s); hosted-domain restriction: %s)",
+                    len(allowed_client_redirect_uris),
+                    allowed_hosted_domain or "none",
                 )
 
             # Always set auth provider for token validation in middleware
