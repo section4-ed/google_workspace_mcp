@@ -18,15 +18,25 @@ from typing import List, Optional, Dict, Any
 # OAuth proxy. FastMCP's OAuthProxy accepts ANY client redirect_uri when no
 # allow-list is set, which enabled OAuth consent-phishing to an attacker-controlled
 # endpoint (SwarmSec #154). We always pass an explicit list; operators should
-# narrow it to the exact first-party clients they use via
-# MCP_ALLOWED_CLIENT_REDIRECT_URIS. This conservative default covers loopback
-# (native/desktop clients) plus the common hosted MCP clients.
+# narrow it to the exact clients they use via MCP_ALLOWED_CLIENT_REDIRECT_URIS.
+#
+# This server is intended for standard LLM clients connecting over MCP OAuth.
+# Native/desktop clients (Claude Desktop, Cursor, VS Code, Cline, Windsurf, Zed,
+# ...) complete the flow on an ephemeral loopback listener, so loopback covers
+# all of them; only hosted web clients (Claude, ChatGPT) need explicit vendor
+# domains. Vendor domains are allowed at the domain level because only the vendor
+# controls a redirect receiver there; an attacker-registered domain still fails.
 DEFAULT_ALLOWED_CLIENT_REDIRECT_URIS = [
+    # Native / desktop LLM clients complete OAuth on a loopback listener.
     "http://localhost:*",
     "http://127.0.0.1:*",
+    # Hosted web LLM clients.
     "https://claude.ai/*",
     "https://claude.com/*",
     "https://*.anthropic.com/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    # IDE web-redirect brokers and custom-scheme desktop clients.
     "https://vscode.dev/*",
     "https://insiders.vscode.dev/*",
     "vscode://*",
