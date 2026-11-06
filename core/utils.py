@@ -13,7 +13,7 @@ from defusedxml import ElementTree as ET
 
 from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
-from auth.google_auth import GoogleAuthenticationError
+from auth.google_auth import GoogleAuthenticationError, get_default_credentials_dir
 from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,21 @@ def _get_allowed_file_dirs() -> list[Path]:
     return [home] if home else []
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    """True if path is root or inside it.
+
+    Falls back to inode comparison so case-variant paths on case-insensitive
+    filesystems (macOS, Windows) cannot slip past a deny rule.
+    """
+    if path.is_relative_to(root):
+        return True
+    if not root.exists():
+        return False
+    return any(
+        p.exists() and os.path.samefile(p, root) for p in (path, *path.parents)
+    )
+
+
 def validate_file_path(file_path: str) -> Path:
     """
     Validate that a file path is safe to read from the server filesystem.
@@ -70,10 +85,8 @@ def validate_file_path(file_path: str) -> Path:
     """
     resolved = Path(file_path).resolve()
 
-    if not resolved.exists():
-        raise FileNotFoundError(f"Path does not exist: {resolved}")
-
-    # Block sensitive file patterns regardless of allowlist
+    # Deny rules run before the existence check so errors do not reveal
+    # whether a blocked file exists. Block sensitive file patterns regardless of allowlist
     resolved_str = str(resolved)
     file_name = resolved.name.lower()
 
@@ -95,25 +108,33 @@ def validate_file_path(file_path: str) -> Path:
         "/private/etc/passwd",
     )
     for prefix in sensitive_prefixes:
-        if resolved_str == prefix or resolved_str.startswith(prefix + "/"):
+        if _is_within(resolved, Path(prefix)):
             raise ValueError(
                 f"Access to '{resolved_str}' is not allowed: "
                 "path is in a restricted system location."
             )
 
-    # Block the credential store directory (WORKSPACE_MCP_CREDENTIALS_DIR takes
-    # precedence, falling back to GOOGLE_MCP_CREDENTIALS_DIR for compatibility)
-    creds_dir = os.environ.get(
-        "WORKSPACE_MCP_CREDENTIALS_DIR",
-        os.environ.get("GOOGLE_MCP_CREDENTIALS_DIR", ""),
-    )
-    if creds_dir:
-        creds_resolved = str(Path(creds_dir).resolve())
-        if resolved_str == creds_resolved or resolved_str.startswith(creds_resolved + "/"):
-            raise ValueError(
-                f"Access to '{resolved_str}' is not allowed: "
-                "path is in the credential storage directory."
-            )
+    # Block the credential store wherever it actually lives, including the
+    # default ~/.google_workspace_mcp/credentials inside the allowed home dir.
+    if _is_within(resolved, Path(get_default_credentials_dir()).resolve()):
+        raise ValueError(
+            f"Access to '{resolved_str}' is not allowed: "
+            "path is in the credential storage directory."
+        )
+
+    # Uploads are reachable only through create_drive_file(upload_id). On a
+    # shared HTTP server every stored attachment belongs to some user's
+    # session, so the whole store is off limits; in stdio the single local
+    # user may reuse attachments they downloaded by path.
+    from auth.oauth_config import get_transport_mode
+    from core.attachment_storage import STORAGE_DIR, UPLOADS_DIR
+
+    private_dir = UPLOADS_DIR if get_transport_mode() == "stdio" else STORAGE_DIR
+    if _is_within(resolved, private_dir.resolve()):
+        raise ValueError(
+            f"Access to '{resolved_str}' is not allowed: "
+            "path is in the server's private attachment storage."
+        )
 
     # Block sensitive directories that commonly contain credentials/keys
     home = Path.home()
@@ -125,8 +146,7 @@ def validate_file_path(file_path: str) -> Path:
         ".config/gcloud",
     )
     for sensitive_dir in sensitive_dirs:
-        blocked = home / sensitive_dir
-        if resolved == blocked or str(resolved).startswith(str(blocked) + "/"):
+        if _is_within(resolved, home / sensitive_dir):
             raise ValueError(
                 f"Access to '{resolved_str}' is not allowed: "
                 "path is in a directory that commonly contains secrets or credentials."
@@ -161,11 +181,10 @@ def validate_file_path(file_path: str) -> Path:
         )
 
     for allowed in allowed_dirs:
-        try:
-            resolved.relative_to(allowed)
+        if resolved.is_relative_to(allowed):
+            if not resolved.exists():
+                raise FileNotFoundError(f"Path does not exist: {resolved}")
             return resolved
-        except ValueError:
-            continue
 
     raise ValueError(
         f"Access to '{resolved_str}' is not allowed: "
@@ -186,8 +205,6 @@ def check_credentials_directory_permissions(credentials_dir: str = None) -> None
         OSError: If there are other file system issues
     """
     if credentials_dir is None:
-        from auth.google_auth import get_default_credentials_dir
-
         credentials_dir = get_default_credentials_dir()
 
     try:

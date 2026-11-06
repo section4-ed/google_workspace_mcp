@@ -112,20 +112,13 @@ class MinimalOAuthServer:
         @self.app.get("/attachments/{file_id}")
         async def serve_attachment(file_id: str, request: Request):
             """Serve a stored attachment file."""
-            storage = get_attachment_storage()
-            metadata = storage.get_attachment_metadata(file_id)
-
-            if not metadata:
+            servable = get_attachment_storage().get_servable(file_id)
+            if servable is None:
                 return JSONResponse(
                     {"error": "Attachment not found or expired"}, status_code=404
                 )
 
-            file_path = storage.get_attachment_path(file_id)
-            if not file_path:
-                return JSONResponse(
-                    {"error": "Attachment file not found"}, status_code=404
-                )
-
+            file_path, metadata = servable
             return FileResponse(
                 path=str(file_path),
                 filename=metadata["filename"],
