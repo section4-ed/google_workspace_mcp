@@ -514,50 +514,67 @@ MAX_UPLOAD_MB = MAX_UPLOAD_BYTES // (1024 * 1024)
 
 @server.custom_route("/upload", methods=["POST"])
 async def upload_file(request: Request):
-    """Accept a multipart file upload and return an upload_id for use with create_drive_file."""
+    """Accept one multipart file; requires a single-use token from create_upload_url."""
+    from core.attachment_storage import get_attachment_storage, get_upload_token_store
+
     content_type = request.headers.get("content-type", "")
     if "multipart/form-data" not in content_type:
         return JSONResponse(
             {"error": "Content-Type must be multipart/form-data"}, status_code=400
         )
 
-    # Reject oversized requests early before buffering the body
-    content_length = request.headers.get("content-length")
-    if content_length:
-        try:
-            if int(content_length) > MAX_UPLOAD_BYTES:
-                return JSONResponse(
-                    {"error": f"File exceeds {MAX_UPLOAD_MB} MB limit"},
-                    status_code=413,
-                )
-        except ValueError:
-            pass
+    # Require a declared size (no chunked bodies) so oversized requests are
+    # rejected before buffering; the server enforces the declared length.
+    try:
+        content_length = int(request.headers.get("content-length", ""))
+    except ValueError:
+        return JSONResponse({"error": "Content-Length required"}, status_code=411)
+    if content_length > MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            {"error": f"File exceeds {MAX_UPLOAD_MB} MB limit"},
+            status_code=413,
+        )
+
+    # The token binds the upload to the user who minted it. Header checks above
+    # leave it unspent; it is consumed here, before the body is read.
+    owner_email = get_upload_token_store().consume(request.query_params.get("token"))
+    if not owner_email:
+        return JSONResponse(
+            {"error": "Valid upload token required (call create_upload_url)."},
+            status_code=401,
+        )
+    used = " This upload URL is now used; call create_upload_url for a new one."
+    storage = get_attachment_storage()
+    storage.cleanup_expired()
 
     try:
         form = await request.form()
         uploaded_file = form.get("file")
-        if uploaded_file is None:
+        if uploaded_file is None or isinstance(uploaded_file, str):
             return JSONResponse(
-                {"error": "Missing required 'file' field"}, status_code=400
+                {"error": "Missing required 'file' field." + used}, status_code=400
             )
 
         file_bytes = await uploaded_file.read()
         if len(file_bytes) > MAX_UPLOAD_BYTES:
             return JSONResponse(
-                {"error": f"File exceeds {MAX_UPLOAD_MB} MB limit"},
+                {"error": f"File exceeds {MAX_UPLOAD_MB} MB limit." + used},
                 status_code=413,
             )
 
-        filename = uploaded_file.filename or form.get("filename")
-        mime_type = uploaded_file.content_type or form.get("mime_type")
+        def text_field(name):
+            value = form.get(name)
+            return value if isinstance(value, str) else None
 
-        from core.attachment_storage import get_attachment_storage
+        filename = uploaded_file.filename or text_field("filename")
+        mime_type = uploaded_file.content_type or text_field("mime_type")
 
-        storage = get_attachment_storage()
-        result = storage.save_bytes(file_bytes, filename=filename, mime_type=mime_type)
+        result = storage.save_bytes(
+            file_bytes, filename=filename, mime_type=mime_type, owner_email=owner_email
+        )
 
         logger.info(
-            f"File uploaded: upload_id={result.file_id}, filename={filename}, size={len(file_bytes)}"
+            f"File uploaded: upload_id={result.file_id}, size={len(file_bytes)}"
         )
         return JSONResponse({
             "upload_id": result.file_id,
@@ -567,7 +584,7 @@ async def upload_file(request: Request):
         })
     except Exception as e:
         logger.error(f"Upload failed: {e}", exc_info=True)
-        return JSONResponse({"error": "Upload failed"}, status_code=500)
+        return JSONResponse({"error": "Upload failed." + used}, status_code=500)
 
 
 @server.custom_route("/attachments/{file_id}", methods=["GET"])
@@ -575,19 +592,13 @@ async def serve_attachment(request: Request):
     """Serve a stored attachment file."""
     from core.attachment_storage import get_attachment_storage
 
-    file_id = request.path_params["file_id"]
-    storage = get_attachment_storage()
-    metadata = storage.get_attachment_metadata(file_id)
-
-    if not metadata:
+    servable = get_attachment_storage().get_servable(request.path_params["file_id"])
+    if servable is None:
         return JSONResponse(
             {"error": "Attachment not found or expired"}, status_code=404
         )
 
-    file_path = storage.get_attachment_path(file_id)
-    if not file_path:
-        return JSONResponse({"error": "Attachment file not found"}, status_code=404)
-
+    file_path, metadata = servable
     return FileResponse(
         path=str(file_path),
         filename=metadata["filename"],

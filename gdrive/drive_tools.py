@@ -26,7 +26,12 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
-from core.attachment_storage import get_attachment_storage, get_attachment_url
+from core.attachment_storage import (
+    get_attachment_storage,
+    get_attachment_url,
+    get_upload_token_store,
+    get_upload_url,
+)
 from core.utils import extract_office_xml_text, handle_http_errors, validate_file_path
 from core.server import server
 from core.config import get_transport_mode
@@ -577,6 +582,44 @@ async def create_drive_folder(
 
 
 @server.tool()
+@handle_http_errors("create_upload_url", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def create_upload_url(service, user_google_email: str) -> str:
+    """
+    Creates a single-use URL for uploading one binary file (PDF, image, Office file) from the client machine.
+
+    POST the file as multipart/form-data with field name "file" to the returned URL, for example:
+    curl -F "file=@report.pdf;type=application/pdf" "<upload_url>"
+    The response contains an upload_id; pass it to create_drive_file to store the file in Drive.
+    The URL works once and expires after 10 minutes. The upload can only be used by the same user.
+    Needs the streamable-http transport with file storage; in stdio mode pass a file:// path to
+    create_drive_file instead.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+
+    Returns:
+        str: The upload URL and its expiry.
+    """
+    if get_transport_mode() == "stdio":
+        raise Exception(
+            "Uploads need the streamable-http transport. In stdio mode, pass "
+            "fileUrl='file:///path/to/file' to create_drive_file instead."
+        )
+    if is_stateless_mode():
+        raise Exception(
+            "Uploads are disabled in stateless mode. Use file_content_base64 or "
+            "an http(s) fileUrl with create_drive_file instead."
+        )
+    token, expires_at = get_upload_token_store().issue(user_google_email)
+    logger.info("[create_upload_url] Issued upload token")
+    return (
+        f"{get_upload_url(token)} (single use, expires "
+        f"{expires_at.astimezone().isoformat(timespec='seconds')})"
+    )
+
+
+@server.tool()
 @handle_http_errors("create_drive_file", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def create_drive_file(
@@ -592,7 +635,7 @@ async def create_drive_file(
 ) -> str:
     """
     Creates a new file in Google Drive, supporting creation within shared drives.
-    Accepts content via text, URL, upload_id (from POST /upload), or base64-encoded data.
+    Accepts content via text, URL, upload_id (from create_upload_url then POST), or base64-encoded data.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -601,7 +644,7 @@ async def create_drive_file(
         folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
         mime_type (str): The MIME type of the file. Defaults to 'text/plain'.
         fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.
-        upload_id (Optional[str]): If provided, uses a file previously uploaded via the POST /upload endpoint. Best for binary files from remote clients.
+        upload_id (Optional[str]): If provided, uses a file the same user uploaded to the URL from create_upload_url. Best for binary files from remote clients. Each upload_id can be used once.
         file_content_base64 (Optional[str]): If provided, base64-encoded file content. Useful for binary files when POST /upload is not available.
 
     Returns:
@@ -638,15 +681,16 @@ async def create_drive_file(
             raise Exception(f"Invalid upload_id format: {upload_id}")
 
         storage = get_attachment_storage()
-        upload_path = storage.get_attachment_path(upload_id)
-        if upload_path is None:
+        # Another user's upload reads as not found, so IDs reveal nothing.
+        # Claiming takes it out of the store so a concurrent call cannot reuse it.
+        owned = storage.claim_owned_upload(upload_id, user_google_email)
+        if owned is None:
             raise Exception(
                 f"Upload not found or expired for upload_id: {upload_id}. "
-                "Upload files via POST /upload first."
+                "Get an upload URL from create_upload_url and POST the file first."
             )
-
-        upload_meta = storage.get_attachment_metadata(upload_id)
-        stored_mime = upload_meta.get("mime_type") if upload_meta else None
+        upload_path, upload_meta = owned
+        stored_mime = upload_meta.get("mime_type")
         if stored_mime and stored_mime != "application/octet-stream" and mime_type == "text/plain":
             mime_type = stored_mime
             file_metadata["mimeType"] = mime_type
@@ -654,6 +698,7 @@ async def create_drive_file(
         try:
             file_data = upload_path.read_bytes()
         except OSError as e:
+            storage.release(upload_id, upload_meta)
             raise Exception(
                 f"Upload file could not be read (may have expired): {e}"
             )
@@ -665,17 +710,30 @@ async def create_drive_file(
             resumable=True,
             chunksize=UPLOAD_CHUNK_SIZE_BYTES,
         )
-
-        created_file = await asyncio.to_thread(
-            service.files()
-            .create(
-                body=file_metadata,
-                media_body=media,
-                fields="id, name, webViewLink",
-                supportsAllDrives=True,
+        drive_call = asyncio.ensure_future(
+            asyncio.to_thread(
+                service.files()
+                .create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields="id, name, webViewLink",
+                    supportsAllDrives=True,
+                )
+                .execute
             )
-            .execute
         )
+
+        def _settle_upload(call):
+            # Runs on the event loop once the Drive request is really over, even
+            # if this tool call was cancelled; the upload stays claimed until then.
+            if call.cancelled() or call.exception() is not None:
+                storage.release(upload_id, upload_meta)  # keep it for a retry
+            else:
+                # The staged copy has served its purpose; do not keep user files on disk.
+                upload_path.unlink(missing_ok=True)
+
+        drive_call.add_done_callback(_settle_upload)
+        created_file = await asyncio.shield(drive_call)
     elif file_content_base64:
         logger.info(f"[create_drive_file] Decoding base64 content ({len(file_content_base64)} chars)")
         try:

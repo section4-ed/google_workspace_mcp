@@ -76,10 +76,9 @@ class TestSaveBytes:
         result = self.storage.save_bytes(b"data", mime_type="image/png")
         assert result.file_id in Path(result.path).name
 
-    def test_save_bytes_retrieval_via_get_attachment_path(self):
+    def test_save_bytes_retrieval_via_get_servable(self):
         result = self.storage.save_bytes(b"retrieve me", filename="r.txt")
-        path = self.storage.get_attachment_path(result.file_id)
-        assert path is not None
+        path, _ = self.storage.get_servable(result.file_id)
         assert path.read_bytes() == b"retrieve me"
 
 
@@ -167,7 +166,7 @@ class TestCreateDriveFileUploadId:
             "gdrive.drive_tools.get_attachment_storage"
         ) as mock_storage_fn:
             mock_storage = Mock()
-            mock_storage.get_attachment_path.return_value = None
+            mock_storage.claim_owned_upload.return_value = None
             mock_storage_fn.return_value = mock_storage
 
             with patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock, return_value="root"):
@@ -193,11 +192,10 @@ class TestCreateDriveFileUploadId:
             "gdrive.drive_tools.get_attachment_storage"
         ) as mock_storage_fn:
             mock_storage = Mock()
-            mock_storage.get_attachment_path.return_value = mock_path
-            mock_storage.get_attachment_metadata.return_value = {
+            mock_storage.claim_owned_upload.return_value = (mock_path, {
                 "mime_type": "image/png",
                 "filename": "photo.png",
-            }
+            })
             mock_storage_fn.return_value = mock_storage
 
             with patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock, return_value="root"):
@@ -225,11 +223,10 @@ class TestCreateDriveFileUploadId:
             "gdrive.drive_tools.get_attachment_storage"
         ) as mock_storage_fn:
             mock_storage = Mock()
-            mock_storage.get_attachment_path.return_value = mock_path
-            mock_storage.get_attachment_metadata.return_value = {
+            mock_storage.claim_owned_upload.return_value = (mock_path, {
                 "mime_type": "image/png",
                 "filename": "photo.png",
-            }
+            })
             mock_storage_fn.return_value = mock_storage
 
             with patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock, return_value="root"):
@@ -261,11 +258,10 @@ class TestCreateDriveFileUploadId:
             "gdrive.drive_tools.get_attachment_storage"
         ) as mock_storage_fn:
             mock_storage = Mock()
-            mock_storage.get_attachment_path.return_value = mock_path
-            mock_storage.get_attachment_metadata.return_value = {
+            mock_storage.claim_owned_upload.return_value = (mock_path, {
                 "mime_type": "image/png",
                 "filename": "photo.png",
-            }
+            })
             mock_storage_fn.return_value = mock_storage
 
             with patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock, return_value="root"):
@@ -296,10 +292,9 @@ class TestCreateDriveFileUploadId:
             "gdrive.drive_tools.get_attachment_storage"
         ) as mock_storage_fn:
             mock_storage = Mock()
-            mock_storage.get_attachment_path.return_value = mock_path
-            mock_storage.get_attachment_metadata.return_value = {
+            mock_storage.claim_owned_upload.return_value = (mock_path, {
                 "mime_type": "application/octet-stream",
-            }
+            })
             mock_storage_fn.return_value = mock_storage
 
             with patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock, return_value="root"):
@@ -429,8 +424,7 @@ class TestCreateDriveFileValidation:
             "gdrive.drive_tools.get_attachment_storage"
         ) as mock_storage_fn:
             mock_storage = Mock()
-            mock_storage.get_attachment_path.return_value = mock_path
-            mock_storage.get_attachment_metadata.return_value = None
+            mock_storage.claim_owned_upload.return_value = (mock_path, {})
             mock_storage_fn.return_value = mock_storage
 
             with patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock, return_value="root"):

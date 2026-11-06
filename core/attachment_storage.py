@@ -8,9 +8,10 @@ Files are automatically cleaned up after expiration (default 1 hour).
 import base64
 import logging
 import os
+import secrets
 import uuid
 from pathlib import Path
-from typing import NamedTuple, Optional, Dict
+from typing import Callable, NamedTuple, Optional, Dict, Tuple
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
@@ -18,17 +19,22 @@ logger = logging.getLogger(__name__)
 # Default expiration: 1 hour
 DEFAULT_EXPIRATION_SECONDS = 3600
 
+# Single-use upload tokens minted by the create_upload_url tool.
+UPLOAD_TOKEN_TTL_SECONDS = 600
+
 # Storage directory - configurable via WORKSPACE_ATTACHMENT_DIR env var
 # Uses absolute path to avoid creating tmp/ in arbitrary working directories (see #327)
 _default_dir = str(Path.home() / ".workspace-mcp" / "attachments")
 STORAGE_DIR = (
     Path(os.getenv("WORKSPACE_ATTACHMENT_DIR", _default_dir)).expanduser().resolve()
 )
+# Private POST /upload files live apart so validate_file_path can block them.
+UPLOADS_DIR = STORAGE_DIR / "uploads"
 
 
-def _ensure_storage_dir() -> None:
-    """Create the storage directory on first use, not at import time."""
-    STORAGE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+def _ensure_dir(directory: Path) -> None:
+    """Create a storage directory on first use, not at import time."""
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
 class SavedAttachment(NamedTuple):
@@ -50,6 +56,7 @@ class AttachmentStorage:
         file_bytes: bytes,
         filename: Optional[str] = None,
         mime_type: Optional[str] = None,
+        owner_email: Optional[str] = None,
     ) -> SavedAttachment:
         """
         Save raw bytes to local disk.
@@ -58,11 +65,12 @@ class AttachmentStorage:
             file_bytes: Raw file bytes
             filename: Original filename (optional)
             mime_type: MIME type (optional)
+            owner_email: Owner of a private upload; owned files are never served (optional)
 
         Returns:
             SavedAttachment with file_id (UUID) and path (absolute file path)
         """
-        return self._save(file_bytes, filename, mime_type)
+        return self._save(file_bytes, filename, mime_type, owner_email=owner_email)
 
     def save_attachment(
         self,
@@ -95,9 +103,11 @@ class AttachmentStorage:
         file_bytes: bytes,
         filename: Optional[str] = None,
         mime_type: Optional[str] = None,
+        owner_email: Optional[str] = None,
     ) -> SavedAttachment:
         """Internal helper to save bytes to disk."""
-        _ensure_storage_dir()
+        target_dir = UPLOADS_DIR if owner_email else STORAGE_DIR
+        _ensure_dir(target_dir)
 
         # Generate unique file ID for metadata tracking
         file_id = str(uuid.uuid4())
@@ -128,8 +138,8 @@ class AttachmentStorage:
             save_name = f"{file_id}{extension}"
 
         # Save file with restrictive permissions (sensitive email/drive content)
-        file_path = (STORAGE_DIR / save_name).resolve()
-        if not file_path.is_relative_to(STORAGE_DIR):
+        file_path = (target_dir / save_name).resolve()
+        if not file_path.is_relative_to(target_dir):
             raise ValueError("Invalid filename: path escapes storage directory")
         try:
             fd = os.open(
@@ -149,15 +159,9 @@ class AttachmentStorage:
                     total_written += written
             finally:
                 os.close(fd)
-            logger.info(
-                f"Saved attachment file_id={file_id} filename={filename or save_name} "
-                f"({len(file_bytes)} bytes) to {file_path}"
-            )
+            logger.info(f"Saved attachment file_id={file_id} ({len(file_bytes)} bytes)")
         except Exception as e:
-            logger.error(
-                f"Failed to save attachment file_id={file_id} "
-                f"filename={filename or save_name} to {file_path}: {e}"
-            )
+            logger.error(f"Failed to save attachment file_id={file_id}: {e}")
             raise
 
         # Store metadata
@@ -167,42 +171,12 @@ class AttachmentStorage:
             "filename": filename or f"attachment{extension}",
             "mime_type": mime_type or "application/octet-stream",
             "size": len(file_bytes),
+            "owner_email": owner_email.lower() if owner_email else None,
             "created_at": now,
             "expires_at": now + timedelta(seconds=self.expiration_seconds),
         }
 
         return SavedAttachment(file_id=file_id, path=str(file_path))
-
-    def get_attachment_path(self, file_id: str) -> Optional[Path]:
-        """
-        Get the file path for an attachment ID.
-
-        Args:
-            file_id: Unique file ID
-
-        Returns:
-            Path object if file exists and not expired, None otherwise
-        """
-        if file_id not in self._metadata:
-            logger.warning(f"Attachment {file_id} not found in metadata")
-            return None
-
-        metadata = self._metadata[file_id]
-        file_path = Path(metadata["file_path"])
-
-        # Check if expired
-        if datetime.now() > metadata["expires_at"]:
-            logger.info(f"Attachment {file_id} has expired, cleaning up")
-            self._cleanup_file(file_id)
-            return None
-
-        # Check if file exists
-        if not file_path.exists():
-            logger.warning(f"Attachment file {file_path} does not exist")
-            del self._metadata[file_id]
-            return None
-
-        return file_path
 
     def get_attachment_metadata(self, file_id: str) -> Optional[Dict]:
         """
@@ -221,12 +195,52 @@ class AttachmentStorage:
 
         # Check if expired
         if datetime.now() > metadata["expires_at"]:
-            self._cleanup_file(file_id)
+            self.delete(file_id)
             return None
 
         return metadata
 
-    def _cleanup_file(self, file_id: str) -> None:
+    def get_servable(self, file_id: str) -> Optional[Tuple[Path, Dict]]:
+        """Path and metadata for /attachments, or None.
+
+        Owned files (POST /upload) are private and never served.
+        """
+        return self._resolve(file_id, lambda owner: not owner)
+
+    def get_owned_upload(
+        self, file_id: str, owner_email: str
+    ) -> Optional[Tuple[Path, Dict]]:
+        """Path and metadata of an upload owned by owner_email, or None."""
+        if not owner_email:
+            return None
+        return self._resolve(file_id, lambda owner: owner == owner_email.lower())
+
+    def claim_owned_upload(
+        self, file_id: str, owner_email: str
+    ) -> Optional[Tuple[Path, Dict]]:
+        """Take an owned upload out of the store so no concurrent call can use it.
+
+        The file stays on disk; call release() to put it back if the caller fails.
+        """
+        owned = self.get_owned_upload(file_id, owner_email)
+        if owned is not None:
+            del self._metadata[file_id]
+        return owned
+
+    def release(self, file_id: str, metadata: Dict) -> None:
+        """Return a claimed upload to the store for a retry."""
+        self._metadata[file_id] = metadata
+
+    def _resolve(
+        self, file_id: str, owner_ok: Callable[[Optional[str]], bool]
+    ) -> Optional[Tuple[Path, Dict]]:
+        metadata = self.get_attachment_metadata(file_id)
+        if not metadata or not owner_ok(metadata.get("owner_email")):
+            return None
+        path = Path(metadata["file_path"])
+        return (path, metadata) if path.exists() else None
+
+    def delete(self, file_id: str) -> None:
         """Remove file and metadata."""
         if file_id in self._metadata:
             file_path = Path(self._metadata[file_id]["file_path"])
@@ -253,13 +267,48 @@ class AttachmentStorage:
         ]
 
         for file_id in expired_ids:
-            self._cleanup_file(file_id)
+            self.delete(file_id)
 
         return len(expired_ids)
 
 
-# Global instance
+class UploadTokenStore:
+    """Single-use, short-lived tokens, minted by the authenticated
+    create_upload_url tool, that bind one POST /upload to the caller's email."""
+
+    def __init__(self, ttl_seconds: int = UPLOAD_TOKEN_TTL_SECONDS):
+        self.ttl_seconds = ttl_seconds
+        self._tokens: Dict[str, Tuple[str, datetime]] = {}
+
+    def issue(self, owner_email: str) -> Tuple[str, datetime]:
+        """Mint a token for owner_email and return it with its expiry."""
+        if not owner_email:
+            raise ValueError("owner_email is required to issue an upload token")
+        self._prune()
+        token = secrets.token_urlsafe(32)
+        expires_at = datetime.now() + timedelta(seconds=self.ttl_seconds)
+        self._tokens[token] = (owner_email.lower(), expires_at)
+        return token, expires_at
+
+    def consume(self, token: Optional[str]) -> Optional[str]:
+        """Return the token's owner and invalidate it, or None if not valid."""
+        entry = self._tokens.pop(token, None)
+        if entry is None:
+            return None
+        owner_email, expires_at = entry
+        if datetime.now() > expires_at:
+            return None
+        return owner_email
+
+    def _prune(self) -> None:
+        now = datetime.now()
+        for token in [t for t, (_, exp) in self._tokens.items() if now > exp]:
+            del self._tokens[token]
+
+
+# Global instances
 _attachment_storage: Optional[AttachmentStorage] = None
+_upload_token_store: Optional[UploadTokenStore] = None
 
 
 def get_attachment_storage() -> AttachmentStorage:
@@ -268,6 +317,30 @@ def get_attachment_storage() -> AttachmentStorage:
     if _attachment_storage is None:
         _attachment_storage = AttachmentStorage()
     return _attachment_storage
+
+
+def get_upload_token_store() -> UploadTokenStore:
+    """Get the global upload token store."""
+    global _upload_token_store
+    if _upload_token_store is None:
+        _upload_token_store = UploadTokenStore()
+    return _upload_token_store
+
+
+def _external_base_url() -> str:
+    """Base URL clients use to reach this server."""
+    from core.config import WORKSPACE_MCP_PORT, WORKSPACE_MCP_BASE_URI
+
+    # Use external URL if set (for reverse proxy scenarios)
+    external_url = os.getenv("WORKSPACE_EXTERNAL_URL")
+    if external_url:
+        return external_url.rstrip("/")
+    return f"{WORKSPACE_MCP_BASE_URI}:{WORKSPACE_MCP_PORT}"
+
+
+def get_upload_url(token: str) -> str:
+    """URL a client POSTs one file to, authorized by a single-use token."""
+    return f"{_external_base_url()}/upload?token={token}"
 
 
 def get_attachment_url(file_id: str) -> str:
@@ -280,13 +353,4 @@ def get_attachment_url(file_id: str) -> str:
     Returns:
         Full URL to access the attachment
     """
-    from core.config import WORKSPACE_MCP_PORT, WORKSPACE_MCP_BASE_URI
-
-    # Use external URL if set (for reverse proxy scenarios)
-    external_url = os.getenv("WORKSPACE_EXTERNAL_URL")
-    if external_url:
-        base_url = external_url.rstrip("/")
-    else:
-        base_url = f"{WORKSPACE_MCP_BASE_URI}:{WORKSPACE_MCP_PORT}"
-
-    return f"{base_url}/attachments/{file_id}"
+    return f"{_external_base_url()}/attachments/{file_id}"

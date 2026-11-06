@@ -34,12 +34,9 @@ async def test_serve_attachment_uses_path_param_file_id(monkeypatch, tmp_path):
     captured = {}
 
     class DummyStorage:
-        def get_attachment_metadata(self, file_id):
+        def get_servable(self, file_id):
             captured["file_id"] = file_id
-            return {"filename": "sample.pdf", "mime_type": "application/pdf"}
-
-        def get_attachment_path(self, _file_id):
-            return file_path
+            return file_path, {"filename": "sample.pdf", "mime_type": "application/pdf"}
 
     monkeypatch.setattr(
         "core.attachment_storage.get_attachment_storage", lambda: DummyStorage()
@@ -55,7 +52,7 @@ async def test_serve_attachment_uses_path_param_file_id(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_serve_attachment_404_when_metadata_missing(monkeypatch):
     class DummyStorage:
-        def get_attachment_metadata(self, _file_id):
+        def get_servable(self, _file_id):
             return None
 
     monkeypatch.setattr(

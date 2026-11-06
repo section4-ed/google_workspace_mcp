@@ -75,6 +75,7 @@ export OAUTHLIB_INSECURE_TRANSPORT=1  # Development only
 | `get_drive_file_download_url` | Core | Download Drive files to local disk |
 | `create_drive_file` | Core | Create files from content or URL (supports file://, http://, https://) |
 | `create_drive_folder` | Core | Create empty folders in Drive or shared drives |
+| `create_upload_url` | Core | Single-use URL for uploading a local binary file, then pass its `upload_id` to `create_drive_file` |
 | `import_to_google_doc` | Core | Import files (MD, DOCX, HTML, etc.) as Google Docs |
 | `get_drive_shareable_link` | Core | Get shareable links for a file |
 | `list_drive_items` | Extended | List folder contents with shared drive support |
