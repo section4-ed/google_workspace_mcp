@@ -21,11 +21,12 @@ from typing import List, Optional, Dict, Any
 # narrow it to the exact clients they use via MCP_ALLOWED_CLIENT_REDIRECT_URIS.
 #
 # This server is intended for standard LLM clients connecting over MCP OAuth.
-# Native/desktop clients (Claude Desktop, Cursor, VS Code, Cline, Windsurf, Zed,
-# ...) complete the flow on an ephemeral loopback listener, so loopback covers
-# all of them; only hosted web clients (Claude, ChatGPT) need explicit vendor
-# domains. Vendor domains are allowed at the domain level because only the vendor
-# controls a redirect receiver there; an attacker-registered domain still fails.
+# Most native/desktop clients (Cursor, VS Code, Cline, Windsurf, Zed, ...)
+# complete the flow on an ephemeral loopback listener, so loopback covers them;
+# hosted web clients (Claude, ChatGPT) need explicit vendor domains. The Claude
+# desktop app is the exception: it uses its own claude:// callback. Vendor
+# domains are allowed at the domain level because only the vendor controls a
+# redirect receiver there; an attacker-registered domain still fails.
 DEFAULT_ALLOWED_CLIENT_REDIRECT_URIS = [
     # Native / desktop LLM clients complete OAuth on a loopback listener.
     "http://localhost:*",
@@ -36,12 +37,13 @@ DEFAULT_ALLOWED_CLIENT_REDIRECT_URIS = [
     "https://*.anthropic.com/*",
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",
-    # IDE web-redirect brokers and custom-scheme desktop clients.
+    # IDE web-redirect brokers.
     "https://vscode.dev/*",
     "https://insiders.vscode.dev/*",
-    "vscode://*",
-    "vscode-insiders://*",
-    "cursor://*",
+    # Claude desktop app (claude://claude.ai/mcp-auth-callback/<id>). FastMCP
+    # matches a pattern's host literally, so a custom-scheme pattern must name its
+    # host: "scheme://*" matches nothing.
+    "claude://claude.ai/mcp-auth-callback/*",
 ]
 
 
